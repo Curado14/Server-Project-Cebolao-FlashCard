@@ -2,3 +2,9 @@
 .cache/
 .claude/
 docs/plans/
+__pycache__/
+*.py[cod]
+tests/robustness/config.local.env
+tests/robustness/reports/*
+!tests/robustness/reports/.gitkeep
+tests/robustness/tmp/

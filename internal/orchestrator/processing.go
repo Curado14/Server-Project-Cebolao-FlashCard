@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"image/jpeg"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -38,24 +39,42 @@ func (s *Service) ProcessPending() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var job, photo, original string
+	queryStarted := time.Now()
 	err := s.db.sql.QueryRow(`SELECT j.id,j.photo_id,p.original_path FROM jobs j JOIN photos p ON p.id=j.photo_id WHERE j.status IN ('PENDING','RETRY_WAIT') AND j.available_at<=? ORDER BY j.created_at LIMIT 1`, time.Now().UTC().Format(time.RFC3339Nano)).Scan(&job, &photo, &original)
+	s.logSlowQuery(time.Since(queryStarted), "worker")
 	if err == sql.ErrNoRows {
 		return nil
 	}
 	if err != nil {
+		s.databaseUnavailable(nil, "worker")
 		return err
 	}
 	now := time.Now().UTC()
-	if _, err = s.db.sql.Exec(`UPDATE jobs SET status='RUNNING',lease_owner='local-worker',lease_until=?,attempt_count=attempt_count+1,updated_at=? WHERE id=? AND status IN ('PENDING','RETRY_WAIT')`, now.Add(5*time.Minute), now, job); err != nil {
+	tx, err := s.db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`UPDATE jobs SET status='RUNNING',lease_owner='local-worker',lease_until=?,attempt_count=attempt_count+1,updated_at=? WHERE id=? AND status IN ('PENDING','RETRY_WAIT')`, now.Add(5*time.Minute).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), job); err != nil {
 		return err
 	}
 	var attemptNo int
-	if err = s.db.sql.QueryRow(`SELECT attempt_count FROM jobs WHERE id=?`, job).Scan(&attemptNo); err != nil {
+	if err = tx.QueryRow(`SELECT attempt_count FROM jobs WHERE id=?`, job).Scan(&attemptNo); err != nil {
 		return err
 	}
-	if _, err = s.db.sql.Exec(`INSERT INTO job_attempts(job_id,attempt_no,event_type,started_at,result) VALUES(?,?,?,?,'RUNNING')`, job, attemptNo, "START", now.Format(time.RFC3339Nano)); err != nil {
+	if _, err = tx.Exec(`INSERT INTO job_attempts(job_id,attempt_no,event_type,started_at,result) VALUES(?,?,?,?,'RUNNING')`, job, attemptNo, "START", now.Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
+	if err = s.audit(tx, auditEvent{EntityType: "JOB", EntityID: job, Action: "STARTED", ActorType: "WORKER", JobID: job, Status: "RUNNING", CreatedAt: now.Format(time.RFC3339Nano)}); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.log(nil, slog.LevelDebug, "job.lease_acquired", "job lease acquired", "worker", "photo_id", photo, "job_id", job, "attempt", attemptNo)
+	s.metricsRegistry.jobsActive.Add(1)
+	defer s.metricsRegistry.jobsActive.Add(-1)
+	s.log(nil, slog.LevelInfo, "job.started", "job started", "worker", "photo_id", photo, "job_id", job, "attempt", attemptNo)
 	f, err := os.Open(original)
 	if err != nil {
 		return s.failJob(job, err)
@@ -70,19 +89,24 @@ func (s *Service) ProcessPending() error {
 	file := id("file")
 	dir := filepath.Join(s.cfg.Root, "processed", safePart(s.cfg.EventID), "sports-web-v1")
 	if err = os.MkdirAll(dir, 0700); err != nil {
+		s.storageWriteFailed(nil, "processed_directory_failed")
 		return s.failJob(job, err)
 	}
 	path := filepath.Join(dir, artifact+".jpg")
 	out, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
+		s.storageWriteFailed(nil, "processed_open_failed")
 		return s.failJob(job, err)
 	}
 	err = jpeg.Encode(out, img, &jpeg.Options{Quality: 88})
 	if err == nil {
 		err = out.Sync()
 	}
-	out.Close()
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
+		s.storageWriteFailed(nil, "processed_write_failed")
 		return s.failJob(job, err)
 	}
 	data, err := os.ReadFile(path)
@@ -91,7 +115,7 @@ func (s *Service) ProcessPending() error {
 	}
 	sum := sha256.Sum256(data)
 	hash := hex.EncodeToString(sum[:])
-	tx, err := s.db.sql.Begin()
+	tx, err = s.db.sql.Begin()
 	if err != nil {
 		return err
 	}
@@ -114,25 +138,53 @@ func (s *Service) ProcessPending() error {
 	if _, err = tx.Exec(`INSERT INTO job_attempts(job_id,attempt_no,event_type,started_at,finished_at,result) VALUES(?,?,?,?,?,'SUCCESS')`, job, attemptNo, "FINISH", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = s.audit(tx, auditEvent{EntityType: "JOB", EntityID: job, Action: "COMPLETED", ActorType: "WORKER", JobID: job, Status: "SUCCEEDED", CreatedAt: now.Format(time.RFC3339Nano)}); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.metricsRegistry.jobsCompleted.Add(1)
+	s.log(nil, slog.LevelInfo, "job.completed", "job completed", "worker", "photo_id", photo, "job_id", job, "attempt", attemptNo)
+	return nil
 }
 func (s *Service) failJob(job string, cause error) error {
 	now := time.Now().UTC()
-	var attemptNo int
-	if err := s.db.sql.QueryRow(`SELECT attempt_count FROM jobs WHERE id=?`, job).Scan(&attemptNo); err != nil {
+	var attemptNo, maxAttempts int
+	if err := s.db.sql.QueryRow(`SELECT attempt_count,max_attempts FROM jobs WHERE id=?`, job).Scan(&attemptNo, &maxAttempts); err != nil {
 		return err
 	}
-	_, err := s.db.sql.Exec(`UPDATE jobs SET status=CASE WHEN attempt_count>=max_attempts THEN 'DEAD' ELSE 'RETRY_WAIT' END,last_error_code='processing_failed',last_error_message=?,lease_owner=NULL,lease_until=NULL,available_at=?,updated_at=? WHERE id=?`, sanitizeError(cause), now.Add(time.Second).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), job)
+	result := "RETRY"
+	status := "RETRY_WAIT"
+	action := "RETRY_SCHEDULED"
+	event := "job.retry_scheduled"
+	if attemptNo >= maxAttempts {
+		result = "FAILURE"
+		status = "DEAD"
+		action = "QUARANTINED"
+		event = "job.quarantined"
+	}
+	tx, err := s.db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`UPDATE jobs SET status=?,last_error_code='processing_failed',last_error_message=?,lease_owner=NULL,lease_until=NULL,available_at=?,updated_at=? WHERE id=?`, status, sanitizeError(cause), now.Add(time.Second).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), job)
 	if err == nil {
-		result := "RETRY"
-		if attemptNo >= 1 {
-			var max int
-			_ = s.db.sql.QueryRow(`SELECT max_attempts FROM jobs WHERE id=?`, job).Scan(&max)
-			if attemptNo >= max {
-				result = "FAILURE"
-			}
+		_, err = tx.Exec(`INSERT INTO job_attempts(job_id,attempt_no,event_type,started_at,finished_at,result,error_code,error_message) VALUES(?,?,?,?,?,?,?,?)`, job, attemptNo, "FINISH", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), result, "processing_failed", sanitizeError(cause))
+	}
+	if err == nil {
+		err = s.audit(tx, auditEvent{EntityType: "JOB", EntityID: job, Action: action, ActorType: "WORKER", JobID: job, Status: status, ErrorCode: "processing_failed", CreatedAt: now.Format(time.RFC3339Nano)})
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err == nil {
+		if result == "FAILURE" {
+			s.metricsRegistry.jobsQuarantined.Add(1)
 		}
-		_, err = s.db.sql.Exec(`INSERT INTO job_attempts(job_id,attempt_no,event_type,started_at,finished_at,result,error_code,error_message) VALUES(?,?,?,?,?,?,?,?)`, job, attemptNo, "FINISH", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), result, "processing_failed", sanitizeError(cause))
+		s.metricsRegistry.jobsFailed.Add(1)
+		s.log(nil, slog.LevelWarn, event, "job failed", "worker", "job_id", job, "attempt", attemptNo, "error_code", "processing_failed")
 	}
 	return err
 }

@@ -51,8 +51,79 @@ CREATE TABLE IF NOT EXISTS audit_events(id INTEGER PRIMARY KEY, entity_type TEXT
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT OR IGNORE INTO schema_migrations(version,name,checksum,applied_at) VALUES(1,'initial','photoedge-v1',?)`, time.Now().UTC().Format(time.RFC3339Nano))
+	if _, err = db.Exec(`INSERT OR IGNORE INTO schema_migrations(version,name,checksum,applied_at) VALUES(1,'initial','photoedge-v1',?)`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	return migrateAuditV2(db)
+}
+
+func migrateAuditV2(db *sql.DB) error {
+	columns, err := tableColumns(db, "audit_events")
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct {
+		name string
+		ddl  string
+	}{
+		{"job_id", `ALTER TABLE audit_events ADD COLUMN job_id TEXT`},
+		{"event_id", `ALTER TABLE audit_events ADD COLUMN event_id TEXT`},
+		{"camera_id", `ALTER TABLE audit_events ADD COLUMN camera_id TEXT`},
+		{"status", `ALTER TABLE audit_events ADD COLUMN status TEXT`},
+		{"error_code", `ALTER TABLE audit_events ADD COLUMN error_code TEXT`},
+	} {
+		if !columns[column.name] {
+			if _, err := db.Exec(column.ddl); err != nil {
+				return err
+			}
+			columns[column.name] = true
+		}
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_request ON audit_events(request_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_job ON audit_events(job_id, created_at);`); err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT OR IGNORE INTO schema_migrations(version,name,checksum,applied_at) VALUES(2,'audit_correlation','photoedge-v2-audit-correlation',?)`, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
+}
+
+func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
+}
+
+func requiredSchemaReady(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM schema_migrations WHERE version=2").Scan(&n); err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("schema migration v2 is pending")
+	}
+	columns, err := tableColumns(db, "audit_events")
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"job_id", "event_id", "camera_id", "status", "error_code"} {
+		if !columns[name] {
+			return fmt.Errorf("audit_events.%s is missing", name)
+		}
+	}
+	return nil
 }
 
 func (d *DB) Close() error { return d.sql.Close() }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -43,14 +44,13 @@ func (s *Service) ExportArtifact(artifactID, destinationID string) error {
 	sum := sha256.Sum256(data)
 	hash := hex.EncodeToString(sum[:])
 	var exportID, status, oldPath, receiptID, oldHash string
+	newExport := false
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	err = s.db.sql.QueryRow(`SELECT id,status,COALESCE(destination_path,''),COALESCE(receipt_id,''),COALESCE(sha256,'') FROM exports WHERE artifact_id=? AND destination_id=?`, artifactID, destinationID).Scan(&exportID, &status, &oldPath, &receiptID, &oldHash)
 	if err == sql.ErrNoRows {
 		exportID = id("export")
 		status = "PENDING"
-		if _, err = s.db.sql.Exec(`INSERT INTO exports(id,artifact_id,destination_id,status,created_at) VALUES(?,?,?,?,?)`, exportID, artifactID, destinationID, status, now); err != nil {
-			return err
-		}
+		newExport = true
 	} else if err != nil {
 		return err
 	}
@@ -68,13 +68,32 @@ func (s *Service) ExportArtifact(artifactID, destinationID string) error {
 	}
 	attemptNo := attempts + 1
 	now = time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err = s.db.sql.Exec(`INSERT INTO export_attempts(export_id,attempt_no,started_at,result) VALUES(?,?,?,'RUNNING')`, exportID, attemptNo, now); err != nil {
+	tx, err := s.db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if newExport {
+		if _, err = tx.Exec(`INSERT INTO exports(id,artifact_id,destination_id,status,created_at) VALUES(?,?,?,?,?)`, exportID, artifactID, destinationID, status, now); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.Exec(`INSERT INTO export_attempts(export_id,attempt_no,started_at,result) VALUES(?,?,?,'RUNNING')`, exportID, attemptNo, now); err != nil {
+		return err
+	}
+	if err = s.audit(tx, auditEvent{EntityType: "EXPORT", EntityID: exportID, Action: "STARTED", ActorType: "SYSTEM", Status: "EXPORTING", CreatedAt: now}); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
 		return err
 	}
 	dst := filepath.Join(cfg.Path, artifactID+".jpg")
 	tmp := dst + ".part"
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		s.finishExportAttempt(exportID, attemptNo, "FAILURE", err)
+		s.storageWriteFailed(nil, "export_write_failed")
+		if finishErr := s.finishExportAttempt(exportID, attemptNo, "FAILURE", err); finishErr != nil {
+			return finishErr
+		}
 		return err
 	}
 	if f, e := os.OpenFile(tmp, os.O_WRONLY, 0600); e == nil {
@@ -82,22 +101,29 @@ func (s *Service) ExportArtifact(artifactID, destinationID string) error {
 		_ = f.Close()
 	}
 	if err := os.Rename(tmp, dst); err != nil {
-		s.finishExportAttempt(exportID, attemptNo, "RETRY", err)
+		s.storageWriteFailed(nil, "export_rename_failed")
+		if finishErr := s.finishExportAttempt(exportID, attemptNo, "RETRY", err); finishErr != nil {
+			return finishErr
+		}
 		return err
 	}
 	check, e := os.ReadFile(dst)
 	if e != nil {
-		s.finishExportAttempt(exportID, attemptNo, "RETRY", e)
+		if finishErr := s.finishExportAttempt(exportID, attemptNo, "RETRY", e); finishErr != nil {
+			return finishErr
+		}
 		return e
 	}
 
 	verify := sha256.Sum256(check)
 	if hex.EncodeToString(verify[:]) != hash {
-		s.finishExportAttempt(exportID, attemptNo, "FAILURE", errors.New("export hash mismatch"))
+		if finishErr := s.finishExportAttempt(exportID, attemptNo, "FAILURE", errors.New("export hash mismatch")); finishErr != nil {
+			return finishErr
+		}
 		return errors.New("export hash mismatch")
 	}
 	now = time.Now().UTC().Format(time.RFC3339Nano)
-	tx, e := s.db.sql.Begin()
+	tx, e = s.db.sql.Begin()
 	if e != nil {
 		return e
 	}
@@ -116,17 +142,41 @@ func (s *Service) ExportArtifact(artifactID, destinationID string) error {
 	if _, e = tx.Exec(`UPDATE export_attempts SET finished_at=?,result='SUCCESS',bytes_written=? WHERE export_id=? AND attempt_no=?`, now, len(data), exportID, attemptNo); e != nil {
 		return e
 	}
-	return tx.Commit()
+	if e = s.audit(tx, auditEvent{EntityType: "EXPORT", EntityID: exportID, Action: "VERIFIED", ActorType: "SYSTEM", Status: "VERIFIED", Metadata: map[string]any{"receipt_id": receiptID, "sha256_prefix": hash[:16]}, CreatedAt: now}); e != nil {
+		return e
+	}
+	if e = tx.Commit(); e != nil {
+		return e
+	}
+	s.log(nil, slog.LevelInfo, "photo.exported", "photo exported", "export", "event_id", s.cfg.EventID)
+	return nil
 }
 
-func (s *Service) finishExportAttempt(exportID string, attemptNo int, result string, cause error) {
+func (s *Service) finishExportAttempt(exportID string, attemptNo int, result string, cause error) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	msg := ""
 	if cause != nil {
 		msg = sanitizeError(cause)
 	}
-	_, _ = s.db.sql.Exec(`UPDATE export_attempts SET finished_at=?,result=?,error_code=CASE WHEN ?='' THEN NULL ELSE 'export_failed' END,error_message=? WHERE export_id=? AND attempt_no=?`, now, result, msg, msg, exportID, attemptNo)
-	_, _ = s.db.sql.Exec(`UPDATE exports SET status='PENDING' WHERE id=?`, exportID)
+	tx, err := s.db.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`UPDATE export_attempts SET finished_at=?,result=?,error_code=CASE WHEN ?='' THEN NULL ELSE 'export_failed' END,error_message=? WHERE export_id=? AND attempt_no=?`, now, result, msg, msg, exportID, attemptNo); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE exports SET status='PENDING' WHERE id=?`, exportID); err != nil {
+		return err
+	}
+	if err = s.audit(tx, auditEvent{EntityType: "EXPORT", EntityID: exportID, Action: result, ActorType: "SYSTEM", Status: "PENDING", ErrorCode: "export_failed", CreatedAt: now}); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.log(nil, slog.LevelWarn, "photo.export_failed", "photo export failed", "export", "error_code", "export_failed")
+	return nil
 }
 
 func (s *Service) RecoverJobs() error { return s.recover() }

@@ -2,24 +2,25 @@ package main
 
 import (
 	"context"
-	"log"
 	"net/http"
-	"os"
 	"photoedge/internal/orchestrator"
 )
 
 func main() {
-	cfg := orchestrator.DefaultConfig()
+	cfg, err := orchestrator.ConfigFromEnv(orchestrator.DefaultConfig())
+	if err != nil {
+		panic(err)
+	}
 	if err := cfg.Validate(); err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	s, err := orchestrator.Open(cfg)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	defer s.Close()
 	s.StartWorkers(context.Background(), 1)
-	log.Printf("photo edge listening on %s", cfg.Bind)
-	log.Fatal(http.ListenAndServe(cfg.Bind, s.Handler()))
-	_ = os.Args
+	if err := http.ListenAndServe(cfg.Bind, s.Handler()); err != nil {
+		panic(err)
+	}
 }

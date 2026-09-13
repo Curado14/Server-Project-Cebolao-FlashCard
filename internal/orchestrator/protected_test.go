@@ -78,6 +78,27 @@ func TestProtectedPathStateContract(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigFromEnvAllowsExplicitNetworkBind(t *testing.T) {
+	t.Setenv("PHOTOEDGE_BIND", "0.0.0.0:8090")
+	t.Setenv("PHOTOEDGE_TOKEN", "phone-test-token")
+	t.Setenv("PHOTOEDGE_MAX_ATTEMPTS", "5")
+
+	c, err := ConfigFromEnv(DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Bind != "0.0.0.0:8090" || !c.AllowNetworkBind {
+		t.Fatalf("network bind was not enabled: %#v", c)
+	}
+	if c.DeviceToken != "phone-test-token" || c.MaxAttempts != 5 {
+		t.Fatalf("env config was not applied: %#v", c)
+	}
+}
+
 func TestProtectedIdempotencyConcurrent(t *testing.T) {
 	s := newTestService(t)
 	data := jpegBytes(t)
