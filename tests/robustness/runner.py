@@ -4,8 +4,9 @@ import sys
 from pathlib import Path
 
 if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from core import build_parser, run_scenario
+    # Keep package-relative imports working when invoked by the documented file path.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tests.robustness.core import build_parser, run_scenario
 else:  # pragma: no cover
     from .core import build_parser, run_scenario
 

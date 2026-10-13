@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.robustness.core import Config, PreconditionError, Report
+from tests.robustness.core import Config, PreconditionError, Report, VALID_JPEG, fixture_sentinels
 
 
 class ConfigAndReportTests(unittest.TestCase):
@@ -45,12 +45,18 @@ class ConfigAndReportTests(unittest.TestCase):
             args = argparse.Namespace(scenario="smoke", photos=1, concurrency=1)
             report = Report("smoke", cfg, args, {"metrics"})
             report.add_key_secret("raw-idempotency-key")
-            report.unexpected_errors.append({"authorization": "Bearer secret-token", "key": "raw-idempotency-key"})
+            fixture_secret = next(iter(fixture_sentinels(VALID_JPEG)))
+            report.unexpected_errors.append({
+                "authorization": "Bearer secret-token",
+                "key": "raw-idempotency-key",
+                "fixture_prefix": fixture_secret,
+            })
             report.finish("failed", 3)
             data = report.as_dict()
             rendered = json.dumps(data)
             self.assertNotIn("secret-token", rendered)
             self.assertNotIn("raw-idempotency-key", rendered)
+            self.assertNotIn(fixture_secret, rendered)
             self.assertIn("[REDACTED]", rendered)
 
 

@@ -49,15 +49,28 @@ Os aliases temporarios `photoedge_accepted_total` e `photoedge_rejected_total` e
 
 ## Harness de robustez local
 
-`tests/robustness/runner.py` e uma suite operacional Python local para validar o servico em modo black-box/gray-box, sem dependencia externa e sem alterar o processo Go. O operador inicia o Photo Edge separadamente com `PHOTOEDGE_*` apontando para root e SQLite descartaveis; o harness le `PHOTOEDGE_ROBUST_*` de `tests/robustness/config.local.env` ou do ambiente e recusa o `data/` do repositorio como root ou banco.
+`tests/robustness/runner.py` e uma suite operacional Python local para validar o servico em modo black-box/gray-box, sem dependencia externa e sem alterar o processo Go. Existem dois modos:
+
+- cenarios classicos contra um servico ja iniciado pelo operador, configurados por `PHOTOEDGE_ROBUST_*` em `tests/robustness/config.local.env` ou no ambiente;
+- cenarios `operational-*`, que compilam `cmd/photoedge` para um binario descartavel sob `--work-root`, iniciam o processo em loopback com `PHOTOEDGE_*` controlado, capturam stdout real em NDJSON, validam readiness HTTP e encerram somente o processo filho que o harness iniciou.
+
+Ambos os modos exigem root e SQLite descartaveis e recusam o `data/` do repositorio como root, banco, stdout, report ou entrada operacional. Nos cenarios `operational-*`, o banco fica em `<work-root>/db/orchestrator.db`, os relatorios ficam no `--reports-dir` informado e o stdout capturado fica sob o proprio `--work-root`. O harness escolhe uma porta loopback livre por execucao e usa token, evento, dispositivo e instance id sentinelas locais.
 
 Os cenarios automaticos sao `smoke`, `single-upload`, `sequential-upload`, `concurrent-upload`, `invalid-inputs`, `idempotency` e `all`. Uploads usam `POST /api/v1/photos`, Bearer, `Idempotency-Key`, multipart `photo` e `event_id` opcional. O runner aceita o `202` vigente com `photo_id`, `status`, `received_at` e `status_url`, e falha se o corpo depender de `job_id`.
 
-Para cada aceite validado, SQLite permanece a fonte de verdade: o runner abre o banco em `mode=ro`, consulta `photos`, `photo_files`, `jobs` e `audit_events`, e verifica que o original persistido existe sob o root configurado. Logs NDJSON sao opcionais e so sao lidos quando o operador fornece um arquivo de captura de stdout; ausencia de captura aparece no relatorio como `logs=not-run`, nao como evidencia de produto. Metricas sao coletadas somente quando a base URL e loopback e sao verificadas contra o formato Prometheus e a politica sem labels de entidade.
+Para cada aceite validado, SQLite permanece a fonte de verdade: o runner abre o banco em `mode=ro`, consulta `photos`, `photo_files`, `jobs` e `audit_events`, e verifica que o original persistido existe sob o root configurado. Rejeicoes esperadas verificam que nao houve aceite duravel, job, original novo ou original orfao sob o root. O cenario de idempotencia valida que o replay A/K preserva cardinalidade e grava `REPLAYED` com `request_id` novo da tentativa, enquanto B/K retorna `409` sem nova entidade. Logs NDJSON sao opcionais e so sao lidos quando o operador fornece um arquivo de captura de stdout; ausencia de captura aparece no relatorio como `logs=not-run`, nao como evidencia de produto. Metricas sao coletadas somente quando a base URL e loopback e sao verificadas contra Content-Type `text/plain; version=0.0.4`, formato Prometheus, series canonicas, aliases e politica sem labels de entidade.
 
 Cada execucao grava relatorios JSON e Markdown em `tests/robustness/reports/`, ignorados pelo Git. Os relatorios registram comando, ambiente Python/plataforma, configuracao sanitizada, contagens HTTP, latencias, aceites, rejeicoes esperadas, inconsistencias, limitacoes e cobertura REQ/PO/EVD. Token, header Authorization, chave idempotente bruta e bytes de fixture sao redigidos e verificados por testes unitarios do harness.
 
-Restart recovery, degradacao de disco, carga maior, celular real e power-loss fisico permanecem procedimentos SYSTEM manuais em root descartavel e exigem aprovacao explicita antes de execucao.
+Os cenarios operacionais locais seguros sao:
+
+- `operational-smoke`: compila e inicia o processo real, espera readiness, executa smoke HTTP/metricas, faz um upload e reconcilia SQLite/filesystem/auditoria/logs/metricas.
+- `operational-restart-recovery`: cria estado recuperavel somente no SQLite descartavel, marcando um job como `RUNNING` com lease vencido, reinicia o processo no mesmo root e verifica que o recovery gera `RECOVERED_AFTER_RESTART`; isso nao promete power-loss fisico nem exige `shutdown.completed`.
+- `operational-storage-limit`: usa `PHOTOEDGE_MIN_FREE_BYTES` acima do espaco livre para classificar falha segura de startup/readiness/intake, sem filler, quota ou mount.
+- `operational-load`: executa carga pequena de consistencia, limitada a 12 fotos, concorrencia 3, duracao 90 s e timeout 120 s, sem tratar latencia como benchmark ou capacidade real.
+- `operational-timeout-cleanup`: confirma que o processo iniciado pelo harness foi encerrado ou reporta falha.
+
+O gate local bloqueia `--request-system disk-fill`, quota, mount, power-loss, validacao mobile/LAN e carga material como `SYSTEM_NOT_AUTHORIZED` antes de executar a acao externa. Low-disk real por quota/mount/fill, power-loss fisico, validacao em celular/camera/LAN real, validacao Windows+Unix ampla e benchmark de capacidade permanecem procedimentos SYSTEM manuais em root descartavel e exigem aprovacao explicita antes de execucao.
 
 ## Falhas e mitigacao
 
@@ -71,8 +84,8 @@ Backups devem ser feitos antes de migracoes e manter banco e originais necessari
 
 - Implementacao: `internal/orchestrator/config.go:ConfigFromEnv`, `Validate`; `access_log.go:NewJSONLogger`, `AccessLog`; `service.go:Open`, `Close`, `checkReadiness`, `metrics`, `observeHTTP`; `metrics.go:writeMetrics`.
 - Testes: `TestContractJSONLog`, `TestContractTelemetryPrivacy`, `TestContractCanonicalFailureEvents`, `TestContractLoggerFailure`, `TestContractMinFreeBytesConfig`, `TestContractReadinessFaultMatrix`, `TestContractMetricsAliasesAndCountersAreConcurrencySafe`, `TestContractLocalOnly`, `TestProtectedPrivacyLocalOnlyReadyHealthMetricsAuditSecret`.
-- Harness: `tests/robustness/runner.py`, `tests/robustness/core.py`, `tests/robustness/test_config_and_reports.py`, `tests/robustness/test_contract_scenarios.py`.
+- Harness: `tests/robustness/runner.py`, `tests/robustness/core.py`, `tests/robustness/operational.py`, `tests/robustness/test_config_and_reports.py`, `tests/robustness/test_contract_scenarios.py`, `tests/robustness/test_operational_contract.py`, `tests/robustness/test_operational_harness.py`.
 
 ## Gaps
 
-Teste de carga em Lenovo, permissao real de instalacao, power-loss fisico, retencao juridica final, validacao mobile real, restart recovery automatizado, degradacao de disco automatizada e validacao SYSTEM em Windows+Unix exigem evidencia operacional complementar.
+Teste de carga em Lenovo, permissao real de instalacao, power-loss fisico, retencao juridica final, validacao mobile real, degradacao de disco real por quota/mount/fill e validacao SYSTEM em Windows+Unix exigem evidencia operacional complementar.

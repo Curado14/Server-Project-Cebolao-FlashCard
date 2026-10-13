@@ -1,0 +1,72 @@
+memoriaImplementacaoInicial: codex resume 01a0967c-7716-7462-80c4-ea7d8c8dbb28
+
+memoriaImplementacaoLog: codex resume 01a0994d-9c5e-7923-9090-df3a36dfb5ef
+
+memoriaImplementacaoTest: codex resume 01a09add-befc-73d2-aa94-7baf75dd71e2
+
+memoriaConversaBridge: codex resume 01a09bf8-9595-7333-a052-ba696d3935d9
+
+
+usar esse prompt para retomar contexto em uma nova sessão:
+
+
+Estou no repositório C:\Users\curad\Desktop\Projetos\PCloader.
+
+  Retome o contexto da arquitetura recomendada para o PhotoEdge Bridge, sem implementar ainda.
+
+  Antes de agir:
+  1. Preserve alterações existentes e não reverta arquivos sem autorização.
+  2. Não faça git add, commit, push, merge ou rebase sem autorização explícita.
+  3. Confira git status, HEAD e staging.
+  4. Leia:
+     - arquitetura-ingestao-photoedge.md
+     - docs/plans/2026-09-13-photoedge-bridge-folder-first-mvp.md
+     - docs/system/photo-edge-orchestrator-overview.md
+     - docs/system/photo-edge-orchestrator-api.md
+     - docs/system/photo-edge-orchestrator-data-and-recovery.md
+     - docs/system/photo-edge-orchestrator-operations.md
+
+  Contexto:
+  - O objetivo do projeto é permitir que fotos capturadas por câmeras profissionais, e futuramente Android/iOS, cheguem automaticamente ao servidor
+  Go PhotoEdge.
+  - A arquitetura recomendada até aqui é um Bridge local em Go, no mesmo monorepo, como processo separado do servidor.
+  - O Bridge deve começar com abordagem folder-first: observar uma pasta de entrada, registrar arquivos em uma fila local SQLite, manter spool/
+  estado próprio, reenviar com retry e confirmar somente após resposta HTTP 202 do servidor.
+  - O servidor PhotoEdge atual deve ser reaproveitado pelo contrato HTTP existente:
+    POST /api/v1/photos
+    Authorization: Bearer <token>
+    Idempotency-Key: <stable-key>
+    multipart field photo
+    optional event_id
+  - O MVP deve focar em JPEG, Windows + Linux, Canon R5/R6 como referência física futura, sem ainda implementar gateway FTP/FTPS/SFTP dentro do
+  servidor.
+  - Para câmeras profissionais, a direção é usar a própria câmera enviando por FTP/FTPS/SFTP para um gateway local endurecido, e o Bridge consumir a
+  pasta de chegada. O FTP receiver não deve ser embutido no servidor principal neste momento.
+  - Dispositivos Android/iOS podem futuramente usar o mesmo conceito lógico: app cliente com fila local, idempotência, retry, backoff, estado local
+  e envio ao mesmo contrato HTTP.
+
+  Estado atual:
+  - Foi criado um plano temporário em docs/plans/2026-09-13-photoedge-bridge-folder-first-mvp.md.
+  - O plano está em PLAN_READY e exige próximo gate com Test Architect independente antes de qualquer implementação.
+  - Ainda não há Test Contract aprovado para o Bridge.
+  - Não implementar nada sem minha autorização explícita.
+
+  Objetivo da próxima sessão:
+  1. Retomar a discussão da arquitetura Bridge recomendada.
+  2. Explicar ou refinar a lógica cliente-servidor para câmeras profissionais.
+  3. Aprofundar as decisões ainda abertas:
+     - gateway FTP/FTPS/SFTP externo vs serviço próprio;
+     - compatibilidade real por modelo de câmera;
+     - estrutura da fila local SQLite;
+     - idempotency key estável;
+     - spool, retry, leases e recuperação após restart;
+     - observabilidade do Bridge;
+     - limites do MVP;
+     - caminho futuro para Android/iOS.
+  4. Se eu autorizar o próximo passo formal, usar a skill test-architect para criar o Test Contract a partir do plano:
+     docs/plans/2026-09-13-photoedge-bridge-folder-first-mvp.md
+
+  Importante:
+  - Não executar implementação por padrão.
+  - Responder em português.
+  - Tratar evidências físicas com cuidado: sem câmera real conectada, marcar compatibilidade como premissa não comprovada.

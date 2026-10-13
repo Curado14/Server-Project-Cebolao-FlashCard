@@ -12,6 +12,8 @@ from tests.robustness.core import (
     Report,
     forbidden_metric_labels,
     parse_prometheus,
+    unexpected_metric_labels,
+    validate_prometheus_contract,
 )
 
 
@@ -98,17 +100,76 @@ class ContractScenarioTests(unittest.TestCase):
             with self.assertRaises(ProductFailure):
                 harness.read_logs()
 
+            fixture_secret = next(iter(report.secret_terms - {"secret-token", "Bearer secret-token"}))
+            log.write_text(f'{{"event":"photo.accepted","payload_prefix":"{fixture_secret}"}}\n', encoding="utf-8")
+            with self.assertRaises(ProductFailure):
+                harness.read_logs()
+
     def test_metrics_respect_loopback_and_entity_label_policy(self):
-        text = """
-        # HELP photoedge_photos_accepted_total Photos accepted.
-        # TYPE photoedge_photos_accepted_total counter
-        photoedge_photos_accepted_total 1
-        photoedge_http_request_duration_ms_bucket{le="5"} 1
-        photoedge_jobs_active{photo_id="photo-1"} 1
-        """
+        text = "\n".join(
+            [
+                "# HELP photoedge_photos_accepted_total Photos accepted.",
+                "# TYPE photoedge_photos_accepted_total counter",
+                "photoedge_photos_accepted_total 1",
+                "# HELP photoedge_photos_rejected_total Photos rejected.",
+                "# TYPE photoedge_photos_rejected_total counter",
+                "photoedge_photos_rejected_total 2",
+                "# HELP photoedge_http_request_duration_ms HTTP duration.",
+                "# TYPE photoedge_http_request_duration_ms histogram",
+                'photoedge_http_request_duration_ms_bucket{le="5"} 1',
+                'photoedge_http_request_duration_ms_bucket{le="+Inf"} 1',
+                "photoedge_http_request_duration_ms_sum 3",
+                "photoedge_http_request_duration_ms_count 1",
+                "# HELP photoedge_photo_persist_duration_ms Persist duration.",
+                "# TYPE photoedge_photo_persist_duration_ms histogram",
+                'photoedge_photo_persist_duration_ms_bucket{le="5"} 1',
+                'photoedge_photo_persist_duration_ms_bucket{le="+Inf"} 1',
+                "photoedge_photo_persist_duration_ms_sum 3",
+                "photoedge_photo_persist_duration_ms_count 1",
+                "# HELP photoedge_queue_depth Queue depth.",
+                "# TYPE photoedge_queue_depth gauge",
+                "photoedge_queue_depth 0",
+                "# HELP photoedge_jobs_active Jobs active.",
+                "# TYPE photoedge_jobs_active gauge",
+                "photoedge_jobs_active 0",
+                "# HELP photoedge_jobs_completed_total Jobs completed.",
+                "# TYPE photoedge_jobs_completed_total counter",
+                "photoedge_jobs_completed_total 0",
+                "# HELP photoedge_jobs_failed_total Jobs failed.",
+                "# TYPE photoedge_jobs_failed_total counter",
+                "photoedge_jobs_failed_total 0",
+                "# HELP photoedge_jobs_quarantined_total Jobs quarantined.",
+                "# TYPE photoedge_jobs_quarantined_total counter",
+                "photoedge_jobs_quarantined_total 0",
+                "# HELP photoedge_storage_free_bytes Storage free.",
+                "# TYPE photoedge_storage_free_bytes gauge",
+                "photoedge_storage_free_bytes 1024",
+                "# HELP photoedge_sqlite_errors_total SQLite errors.",
+                "# TYPE photoedge_sqlite_errors_total counter",
+                "photoedge_sqlite_errors_total 0",
+                "# HELP photoedge_logging_errors_total Logging errors.",
+                "# TYPE photoedge_logging_errors_total counter",
+                "photoedge_logging_errors_total 0",
+                "# HELP photoedge_accepted_total Alias.",
+                "# TYPE photoedge_accepted_total counter",
+                "photoedge_accepted_total 1",
+                "# HELP photoedge_rejected_total Alias.",
+                "# TYPE photoedge_rejected_total counter",
+                "photoedge_rejected_total 2",
+            ]
+        )
         parsed = parse_prometheus(text)
         self.assertIn("photoedge_photos_accepted_total", parsed)
-        self.assertEqual(forbidden_metric_labels(text), {"photo_id"})
+        metadata = {
+            line.split()[2]: line.split()[3]
+            for line in text.splitlines()
+            if line.startswith("# TYPE ")
+        }
+        self.assertEqual(validate_prometheus_contract(parsed, metadata, text), [])
+        self.assertEqual(forbidden_metric_labels('photoedge_jobs_active{photo_id="photo-1"} 1'), {"photo_id"})
+        self.assertEqual(unexpected_metric_labels('photoedge_jobs_active{status="ready"} 1'), {"status"})
+        broken_alias = text.replace("photoedge_accepted_total 1", "photoedge_accepted_total 99")
+        self.assertTrue(any("alias" in item for item in validate_prometheus_contract(parse_prometheus(broken_alias), metadata, broken_alias)))
 
     def test_invalid_inputs_leave_no_durable_acceptance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -120,6 +181,21 @@ class ContractScenarioTests(unittest.TestCase):
             after = harness.count_logical_entities("missing-photo")
             self.assertEqual(before, after)
             self.assertEqual(after, {"photos": 0, "requests": 0, "files": 0, "jobs": 0})
+
+            class OrphaningHarness(Harness):
+                def upload(self, photo, key, filename, token=""):
+                    original = self.cfg.storage_root / "originals" / f"{filename}.orphan"
+                    original.parent.mkdir(parents=True, exist_ok=True)
+                    original.write_bytes(b"orphan-original")
+                    status = 401 if token in {None, "wrong-token"} else 400
+                    if filename in {"not-jpeg.jpg", "corrupt-jpeg.jpg"}:
+                        status = 422
+                    return HTTPResult("POST", "/api/v1/photos", status, 1.0, {"code": "rejected"}, {}, False)
+
+            report = make_report(cfg)
+            OrphaningHarness(cfg, report).invalid_inputs()
+            self.assertTrue(any("created original files under root" in item for item in report.inconsistencies))
+            self.assertTrue(any("increased orphan originals" in item for item in report.inconsistencies))
 
     def test_idempotency_replay_and_conflict_preserve_cardinality(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,8 +218,21 @@ class ContractScenarioTests(unittest.TestCase):
             harness = Harness(cfg, report)
             self.assertEqual(harness.count_logical_entities("key-1"), {"photos": 1, "requests": 1, "files": 1, "jobs": 1})
             self.assertEqual(harness.count_audit("photo-1", "REPLAYED"), 1)
+            accepted_ids, replay_ids = harness.validate_replay_audit("photo-1", "req-1", "req-2", 0)
+            self.assertEqual(accepted_ids, {"req-1"})
+            self.assertEqual(replay_ids, {"req-2"})
             harness.reconcile_acceptance("photo-1")
             self.assertEqual(report.inconsistencies, [])
+
+            con = sqlite3.connect(cfg.db_path)
+            con.execute("DELETE FROM audit_events WHERE action='REPLAYED'")
+            con.execute("INSERT INTO audit_events(entity_id,action,request_id,job_id,event_id,camera_id,status) VALUES(?,?,?,?,?,?,?)", ("photo-1", "REPLAYED", "req-1", None, "local-event", "camera_01", "STORED"))
+            con.commit()
+            con.close()
+            failing_report = make_report(cfg)
+            Harness(cfg, failing_report).validate_replay_audit("photo-1", "req-1", "req-2", 0)
+            self.assertTrue(any("not uniquely correlated" in item for item in failing_report.inconsistencies))
+            self.assertTrue(any("not distinct" in item for item in failing_report.inconsistencies))
 
 
 if __name__ == "__main__":

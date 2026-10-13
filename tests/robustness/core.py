@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import socket
 import sqlite3
 import statistics
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-CHANGE_ID = "robustez-via-script-photo-edge"
+CHANGE_ID = "robustez-operacional-servidor-photo-edge"
 DEFAULT_VERIFY = ("sqlite", "filesystem", "audit", "logs", "metrics")
 METRIC_TYPES = {
     "photoedge_photos_accepted_total": "counter",
@@ -56,6 +57,11 @@ ENTITY_LABEL_FORBIDDEN = {
     "remote_addr",
     "user_agent",
 }
+METRIC_ALLOWED_LABELS = {"le"}
+PROMETHEUS_SAMPLE_RE = re.compile(
+    r"^[a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^{}\r\n]*\})?\s+[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$|"
+    r"^[a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^{}\r\n]*\})?\s+(?:NaN|\+Inf|-Inf)$"
+)
 
 # 1x1 JPEG, deterministic and intentionally tiny.
 VALID_JPEG = base64.b64decode(
@@ -208,6 +214,7 @@ class Report:
         self.inconsistencies: list[str] = []
         self.limitations: list[str] = []
         self.metrics: dict[str, Any] = {}
+        self.operational: dict[str, Any] = {}
         self.coverage: set[str] = set()
         self.secret_terms: set[str] = {cfg.token, "Bearer " + cfg.token}
         for fixture in (VALID_JPEG, ALT_JPEG, CORRUPT_JPEG, b"not a jpeg"):
@@ -256,6 +263,7 @@ class Report:
             "inconsistencies": self.inconsistencies,
             "limitations": self.limitations,
             "metrics": self.metrics,
+            "operational": self.operational,
             "coverage": sorted(self.coverage),
         }
         return redact(data, self.secret_terms)
@@ -382,6 +390,7 @@ class Harness:
         first_request_id = first_result.headers.get("x-request-id")
         first = self.accept_202(first_result)
         before = self.count_logical_entities(key)
+        replay_audit_before = self.count_audit(first["photo_id"], "REPLAYED")
         second_result = self.upload(VALID_JPEG, key, "sample_a.jpg")
         second_request_id = second_result.headers.get("x-request-id")
         second = self.accept_202(second_result)
@@ -390,20 +399,12 @@ class Harness:
             self.report.fail("idempotency replay returned a different photo_id")
         if before != after_replay:
             self.report.fail(f"idempotency replay changed logical cardinality: {before} -> {after_replay}")
-        replay_audit = self.audit_rows(first["photo_id"], "REPLAYED")
-        accepted_audit = self.audit_rows(first["photo_id"], "ACCEPTED")
-        accepted_request_ids = {row.get("request_id") for row in accepted_audit if row.get("request_id")}
-        replay_request_ids = {row.get("request_id") for row in replay_audit if row.get("request_id")}
-        if not replay_request_ids:
-            self.report.fail("idempotency replay did not create REPLAYED audit row with request_id")
-        if not second_request_id:
-            self.report.fail("idempotency replay response did not expose X-Request-Id")
-        elif second_request_id not in replay_request_ids:
-            self.report.fail("idempotency REPLAYED audit row is not correlated to the replay X-Request-Id")
-        if first_request_id and second_request_id and first_request_id == second_request_id:
-            self.report.fail("idempotency first and replay attempts used the same request_id")
-        if accepted_request_ids & replay_request_ids:
-            self.report.fail("idempotency REPLAYED audit request_id was not distinct from ACCEPTED request_id")
+        accepted_request_ids, replay_request_ids = self.validate_replay_audit(
+            first["photo_id"],
+            first_request_id,
+            second_request_id,
+            replay_audit_before,
+        )
         conflict = self.upload(ALT_JPEG, key, "sample_b.jpg")
         if conflict.status != 409:
             self.report.fail(f"idempotency conflict expected 409, got {conflict.status}")
@@ -419,6 +420,35 @@ class Harness:
             "replayed_request_ids": sorted(replay_request_ids),
         })
         self.report.expected_rejections.append({"case": "idempotency-conflict", "status": conflict.status})
+
+    def validate_replay_audit(
+        self,
+        photo_id: str,
+        first_request_id: str | None,
+        second_request_id: str | None,
+        replay_count_before: int,
+    ) -> tuple[set[str], set[str]]:
+        replay_audit = self.audit_rows(photo_id, "REPLAYED")
+        accepted_audit = self.audit_rows(photo_id, "ACCEPTED")
+        accepted_request_ids = {row.get("request_id") for row in accepted_audit if row.get("request_id")}
+        replay_request_ids = {row.get("request_id") for row in replay_audit if row.get("request_id")}
+        if len(replay_audit) <= replay_count_before:
+            self.report.fail("idempotency replay did not append a REPLAYED audit row")
+        if len(replay_audit) != len(replay_request_ids):
+            self.report.fail("idempotency REPLAYED audit row without request_id")
+        if not replay_request_ids:
+            self.report.fail("idempotency replay did not create REPLAYED audit row with request_id")
+        if not second_request_id:
+            self.report.fail("idempotency replay response did not expose X-Request-Id")
+        else:
+            matching_replay_rows = [row for row in replay_audit if row.get("request_id") == second_request_id]
+            if len(matching_replay_rows) != 1:
+                self.report.fail("idempotency REPLAYED audit row is not uniquely correlated to the replay X-Request-Id")
+        if first_request_id and second_request_id and first_request_id == second_request_id:
+            self.report.fail("idempotency first and replay attempts used the same request_id")
+        if accepted_request_ids & replay_request_ids:
+            self.report.fail("idempotency REPLAYED audit request_id was not distinct from ACCEPTED request_id")
+        return accepted_request_ids, replay_request_ids
 
     def request(self, method: str, path: str, body: bytes | None = None, headers: dict[str, str] | None = None) -> HTTPResult:
         url = self.cfg.base_url + path
@@ -565,17 +595,21 @@ class Harness:
             return
         parsed_metrics = parse_prometheus(result.body)
         metadata = parse_prometheus_metadata(result.body)
-        metric_errors = validate_prometheus_contract(parsed_metrics, metadata)
+        metric_errors = validate_prometheus_contract(parsed_metrics, metadata, result.body)
         for error in metric_errors:
             self.report.fail(error)
         forbidden = forbidden_metric_labels(result.body)
         if forbidden:
             self.report.fail("metrics contain forbidden entity labels: " + ", ".join(sorted(forbidden)))
+        unexpected = unexpected_metric_labels(result.body)
+        if unexpected:
+            self.report.fail("metrics contain unexpected labels: " + ", ".join(sorted(unexpected)))
         self.report.metrics = {
             "series": sorted(parsed_metrics),
             "types": metadata,
             "aliases": {alias: parsed_metrics.get(alias, []) for alias in sorted(METRIC_ALIASES)},
             "forbidden_entity_labels": sorted(forbidden),
+            "unexpected_labels": sorted(unexpected),
         }
 
     def open_readonly_db(self) -> sqlite3.Connection:
@@ -639,6 +673,11 @@ class Harness:
 
 
 def run_scenario(args: argparse.Namespace) -> tuple[Report, int]:
+    if args.scenario.startswith("operational-"):
+        from .operational import run_operational_scenario
+
+        return run_operational_scenario(args)
+
     cfg = Config.load(args.config)
     verify = parse_verify(args.verify)
     report = Report(args.scenario, cfg, args, verify)
@@ -683,11 +722,35 @@ def run_scenario(args: argparse.Namespace) -> tuple[Report, int]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Photo Edge local robustness harness")
-    parser.add_argument("--scenario", required=True, choices=["smoke", "single-upload", "sequential-upload", "concurrent-upload", "invalid-inputs", "idempotency", "all"])
+    parser.add_argument(
+        "--scenario",
+        required=True,
+        choices=[
+            "smoke",
+            "single-upload",
+            "sequential-upload",
+            "concurrent-upload",
+            "invalid-inputs",
+            "idempotency",
+            "all",
+            "operational-smoke",
+            "operational-restart-recovery",
+            "operational-storage-limit",
+            "operational-load",
+            "operational-timeout-cleanup",
+        ],
+    )
     parser.add_argument("--config", default="tests/robustness/config.local.env")
     parser.add_argument("--verify", default=",".join(DEFAULT_VERIFY), help="comma-separated: sqlite,filesystem,audit,logs,metrics")
     parser.add_argument("--photos", type=int)
     parser.add_argument("--concurrency", type=int)
+    parser.add_argument("--work-root")
+    parser.add_argument("--reports-dir")
+    parser.add_argument("--timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--duration-seconds", type=float)
+    parser.add_argument("--min-free-bytes")
+    parser.add_argument("--force-expired-lease", action="store_true")
+    parser.add_argument("--request-system", choices=["disk-fill", "quota", "mount", "power-loss", "mobile", "lan", "material-load"])
     parser.add_argument("--no-report", action="store_true")
     return parser
 
@@ -787,8 +850,10 @@ def metric_value(samples: list[str]) -> float | None:
     return None
 
 
-def validate_prometheus_contract(series: dict[str, list[str]], metadata: dict[str, str]) -> list[str]:
+def validate_prometheus_contract(series: dict[str, list[str]], metadata: dict[str, str], text: str | None = None) -> list[str]:
     errors: list[str] = []
+    if text is not None:
+        errors.extend(validate_prometheus_text_format(text))
     for name, expected_type in sorted(METRIC_TYPES.items()):
         if metadata.get(name) != expected_type:
             errors.append(f"metrics type mismatch for {name}: expected {expected_type}, got {metadata.get(name)}")
@@ -807,6 +872,19 @@ def validate_prometheus_contract(series: dict[str, list[str]], metadata: dict[st
     return errors
 
 
+def validate_prometheus_text_format(text: str) -> list[str]:
+    errors: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("# HELP ") or stripped.startswith("# TYPE "):
+            continue
+        if stripped.startswith("#"):
+            errors.append(f"metrics line {lineno} is unsupported comment format")
+        elif not PROMETHEUS_SAMPLE_RE.match(stripped):
+            errors.append(f"metrics line {lineno} is not valid Prometheus 0.0.4 sample")
+    return errors
+
+
 def forbidden_metric_labels(text: str) -> set[str]:
     found: set[str] = set()
     for line in text.splitlines():
@@ -816,6 +894,19 @@ def forbidden_metric_labels(text: str) -> set[str]:
         for pair in labels.split(","):
             name = pair.split("=", 1)[0].strip()
             if name in ENTITY_LABEL_FORBIDDEN:
+                found.add(name)
+    return found
+
+
+def unexpected_metric_labels(text: str) -> set[str]:
+    found: set[str] = set()
+    for line in text.splitlines():
+        if "{" not in line or "}" not in line or line.strip().startswith("#"):
+            continue
+        labels = line.split("{", 1)[1].split("}", 1)[0]
+        for pair in labels.split(","):
+            name = pair.split("=", 1)[0].strip()
+            if name and name not in METRIC_ALLOWED_LABELS:
                 found.add(name)
     return found
 
@@ -903,7 +994,11 @@ def is_relative_to(path: Path, parent: Path) -> bool:
         path.relative_to(parent)
         return True
     except ValueError:
-        return False
+        try:
+            common = os.path.commonpath([os.path.normcase(str(path)), os.path.normcase(str(parent))])
+        except ValueError:
+            return False
+        return common == os.path.normcase(str(parent))
 
 
 def now() -> str:

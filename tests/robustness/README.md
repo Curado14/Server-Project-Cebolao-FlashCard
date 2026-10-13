@@ -2,7 +2,7 @@
 
 This suite drives the local Photo Edge Orchestrator through the documented HTTP API and reconciles accepted uploads against SQLite, the filesystem, audit rows, optional stdout NDJSON capture, and loopback Prometheus metrics.
 
-It does not start, stop, restart, migrate, repair, or clean the service. Run it only against a disposable local root and database. Do not point it at the repository `data/` directory or at production/user data.
+The classic scenarios run against a service that is already started by the operator. The `operational-*` scenarios build a disposable `cmd/photoedge` binary under `--work-root`, start it on loopback, capture stdout NDJSON, and clean up only the process they started. Run every scenario only against a disposable local root and database. Do not point it at the repository `data/` directory or at production/user data.
 
 ## Configuration
 
@@ -48,6 +48,27 @@ python tests\robustness\runner.py --scenario all --photos 10 --concurrency 2 --c
 
 Reports are written as JSON and Markdown under `tests/robustness/reports/`. They include sanitized configuration, command, Python/platform details, counts, latencies, inconsistencies, limitations, and covered evidence IDs. Raw bearer tokens, Authorization headers, raw idempotency keys, and fixture bytes are never written.
 
+To reproduce the report sanitization check with ripgrep, run `rg -uuu -n "photoedge-operational-secret-token|Bearer photoedge-operational-secret-token|Authorization|Idempotency-Key|/9j/4AAQSkZJRgABAQ|ffd8ffe0|not a jpeg" tests/robustness/reports`. On Windows hosts without `rg`, the equivalent is `Get-ChildItem -Path tests\\robustness\\reports -Recurse -File | Select-String -Pattern "photoedge-operational-secret-token|Bearer photoedge-operational-secret-token|Authorization|Idempotency-Key|/9j/4AAQSkZJRgABAQ|ffd8ffe0|not a jpeg"`; it must return no matches.
+
+## Operational local scenarios
+
+Operational commands require explicit disposable paths. A safe Windows pattern is:
+
+```powershell
+$root=Join-Path $env:TEMP ('photoedge-op-smoke-' + [guid]::NewGuid().ToString('N'))
+python -m tests.robustness.runner --scenario operational-smoke --work-root $root --reports-dir (Join-Path $root 'reports') --photos 1 --concurrency 1 --timeout-seconds 45
+```
+
+Available local-safe scenarios:
+
+- `operational-smoke`: builds and starts `cmd/photoedge`, waits for readiness, verifies health/metrics, performs one upload, reconciles SQLite/filesystem/audit, and validates stdout NDJSON.
+- `operational-restart-recovery`: prepares an expired lease only in the disposable SQLite database, restarts the managed process, and verifies `RECOVERED_AFTER_RESTART` without claiming physical power-loss coverage.
+- `operational-storage-limit`: sets a safe `PHOTOEDGE_MIN_FREE_BYTES` threshold and classifies startup/readiness failure without filler files, quota, or mount operations.
+- `operational-load`: performs bounded consistency load with at most 12 photos, concurrency 3, duration 90 seconds, and timeout 120 seconds; it is not a benchmark.
+- `operational-timeout-cleanup`: verifies that a process started by the harness is terminated or reported as a failure.
+
+Requests for `--request-system disk-fill`, quota, mount, power-loss, mobile/LAN validation, or material load are blocked as `SYSTEM_NOT_AUTHORIZED` in the local tier before spawning a process.
+
 ## Scenarios
 
 - `smoke`: checks liveness, readiness, SQLite read-only access, and metrics when requested and loopback-accessible.
@@ -60,4 +81,4 @@ Reports are written as JSON and Markdown under `tests/robustness/reports/`. They
 
 ## Manual SYSTEM procedures
 
-Restart recovery, disk degradation, larger load, real phones, and physical power-loss are outside the automatic budget. They require a disposable root and explicit human approval before execution.
+Quota/mount/disk fill, real low-disk certification, real phones, LAN validation, material load, and physical power-loss are outside the automatic local budget. They require a disposable root, explicit human approval, and a separate SYSTEM procedure before execution.
